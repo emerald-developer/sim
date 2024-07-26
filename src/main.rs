@@ -21,11 +21,6 @@ fn lj_potential(r: f64) -> f64 {
     4.0 * epsilon * ((sigma / r).powi(12) - (sigma / r).powi(6))
 }
 
-fn apply_pbc(mut position: f64, l: f64) -> f64 {
-    position -= (position / l).floor() * l;
-    position
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     
@@ -39,6 +34,9 @@ fn main() {
     let dt: f64 = args[3].parse().expect("Invalid timestep");
     let steps: usize = args[4].parse().expect("Invalid total steps");
     let snapshot_interval: usize = args[5].parse().expect("Invalid snapshot interval");
+
+    let target_temperature: f64 = 87.3; // Target temperature
+    let tau: f64 = 0.1; // Coupling constant for the Berendsen thermostat
 
     let mut rng = rand::thread_rng();
     let mut positions = vec![[0.0; 3]; n];
@@ -55,8 +53,7 @@ fn main() {
     // Initialize velocities from Maxwell-Boltzmann distribution
     let mass_argon: f64 = 39.95;
     let kb: f64 = 0.0083144621;
-    let temperature: f64 = 87.3;
-    let velocity_factor = (kb * temperature / mass_argon).sqrt();
+    let velocity_factor = (kb * target_temperature / mass_argon).sqrt();
     for vel in velocities.iter_mut() {
         for coord in vel.iter_mut() {
             *coord = rng.gen::<f64>() * velocity_factor;
@@ -79,13 +76,6 @@ fn main() {
         // Update progress bar
         pb.set_position(step as u64);
 
-        // Apply periodic boundary conditions
-        for pos in positions.iter_mut() {
-            for coord in pos.iter_mut() {
-                *coord = apply_pbc(*coord, l);
-            }
-        }
-
         // Calculate forces
         let mut forces = vec![[0.0; 3]; n];
         for i in 0..n {
@@ -93,7 +83,8 @@ fn main() {
                 let mut r_ij = [0.0; 3];
                 for k in 0..3 {
                     r_ij[k] = positions[i][k] - positions[j][k];
-                    r_ij[k] -= (r_ij[k] / l).round() * l; // Apply minimum image convention
+                    // Apply minimum image convention
+                    r_ij[k] -= (r_ij[k] / l).round() * l;
                 }
                 let r = (r_ij[0].powi(2) + r_ij[1].powi(2) + r_ij[2].powi(2)).sqrt();
                 let force = lj_potential(r) / r;
@@ -109,10 +100,19 @@ fn main() {
         for i in 0..n {
             for j in 0..3 {
                 positions_new[i][j] = 2.0 * positions[i][j] - positions_old[i][j] + forces[i][j] * dt.powi(2);
-                if positions_new[i][j] > l {
-                    positions_new[i][j] -= l;
-                } else if positions_new[i][j] < 0.0 {
-                    positions_new[i][j] += l;
+            }
+        }
+
+        // Update velocities and handle boundary collisions
+        for i in 0..n {
+            for j in 0..3 {
+                // Check for boundary collisions
+                if positions_new[i][j] >= l {
+                    positions_new[i][j] = 2.0 * l - positions_new[i][j]; // Reflect position
+                    velocities[i][j] = -velocities[i][j]; // Reverse velocity
+                } else if positions_new[i][j] <= 0.0 {
+                    positions_new[i][j] = -positions_new[i][j]; // Reflect position
+                    velocities[i][j] = -velocities[i][j]; // Reverse velocity
                 }
             }
         }
@@ -121,6 +121,23 @@ fn main() {
         for i in 0..n {
             for j in 0..3 {
                 velocities[i][j] = (positions_new[i][j] - positions_old[i][j]) / (2.0 * dt);
+            }
+        }
+
+        // Calculate the current temperature
+        let mut kinetic_energy = 0.0;
+        for vel in &velocities {
+            kinetic_energy += 0.5 * mass_argon * (vel[0].powi(2) + vel[1].powi(2) + vel[2].powi(2));
+        }
+        let current_temperature = (2.0 * kinetic_energy) / (3.0 * n as f64 * kb);
+
+        // Calculate the scaling factor
+        let scaling_factor = (1.0 + dt / tau * (target_temperature / current_temperature - 1.0)).sqrt();
+
+        // Scale the velocities
+        for vel in velocities.iter_mut() {
+            for coord in vel.iter_mut() {
+                *coord *= scaling_factor;
             }
         }
 
