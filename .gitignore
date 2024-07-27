@@ -1,3 +1,4 @@
 target/
 .venv/
 argon_simulation.mp4
+simulation_data.json
