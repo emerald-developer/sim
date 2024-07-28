@@ -1,9 +1,11 @@
+use rayon::prelude::*;
 use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 use std::env;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle, HumanDuration};
+use std::time::{Instant, Duration};
 
 #[derive(Serialize)]
 struct SimulationData {
@@ -39,122 +41,123 @@ fn main() {
     let tau: f64 = 0.1; // Coupling constant for the Berendsen thermostat
 
     let mut rng = rand::thread_rng();
-    let mut positions = vec![[0.0; 3]; n];
-    let mut velocities = vec![[0.0; 3]; n];
-    let mut positions_old = vec![[0.0; 3]; n];
+    let mut positions = (0..n).map(|_| {
+        [rng.gen::<f64>() * l, rng.gen::<f64>() * l, rng.gen::<f64>() * l]
+    }).collect::<Vec<_>>();
 
-    // Initialize positions randomly in the box
-    for pos in positions.iter_mut() {
-        for coord in pos.iter_mut() {
-            *coord = rng.gen::<f64>() * l;
-        }
-    }
-
-    // Initialize velocities from Maxwell-Boltzmann distribution
     let mass_argon: f64 = 39.95;
     let kb: f64 = 0.0083144621;
     let velocity_factor = (kb * target_temperature / mass_argon).sqrt();
-    for vel in velocities.iter_mut() {
-        for coord in vel.iter_mut() {
-            *coord = rng.gen::<f64>() * velocity_factor;
-        }
-    }
+    let mut velocities = (0..n).map(|_| {
+        [
+            rng.gen::<f64>() * velocity_factor,
+            rng.gen::<f64>() * velocity_factor,
+            rng.gen::<f64>() * velocity_factor
+        ]
+    }).collect::<Vec<_>>();
 
-    positions_old.copy_from_slice(&positions);
+    let mut positions_old = positions.clone();
 
     let mut trajectory = Vec::new();
 
-    // Set up the progress bar
     let pb = ProgressBar::new(steps as u64);
     pb.set_style(ProgressStyle::default_bar()
         .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
         .unwrap()
         .progress_chars("##-"));
 
+    let start_time = Instant::now();
+    let mut last_update = start_time;
+    let update_interval = Duration::from_secs(1);
+
     // Perform simulation
     for step in 0..steps {
-        // Update progress bar
         pb.set_position(step as u64);
 
-        // Calculate forces
-        let mut forces = vec![[0.0; 3]; n];
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let mut r_ij = [0.0; 3];
-                for k in 0..3 {
-                    r_ij[k] = positions[i][k] - positions[j][k];
-                    // Apply minimum image convention
-                    r_ij[k] -= (r_ij[k] / l).round() * l;
-                }
-                let r = (r_ij[0].powi(2) + r_ij[1].powi(2) + r_ij[2].powi(2)).sqrt();
-                let force = lj_potential(r) / r;
-                for k in 0..3 {
-                    forces[i][k] += force * r_ij[k];
-                    forces[j][k] -= force * r_ij[k];
-                }
-            }
-        }
-
-        // Verlet integration
-        let mut positions_new = vec![[0.0; 3]; n];
-        for i in 0..n {
-            for j in 0..3 {
-                positions_new[i][j] = 2.0 * positions[i][j] - positions_old[i][j] + forces[i][j] * dt.powi(2);
-            }
-        }
-
-        // Update velocities and handle boundary collisions
-        for i in 0..n {
-            for j in 0..3 {
-                // Check for boundary collisions
-                if positions_new[i][j] >= l {
-                    positions_new[i][j] = 2.0 * l - positions_new[i][j]; // Reflect position
-                    velocities[i][j] = -velocities[i][j]; // Reverse velocity
-                } else if positions_new[i][j] <= 0.0 {
-                    positions_new[i][j] = -positions_new[i][j]; // Reflect position
-                    velocities[i][j] = -velocities[i][j]; // Reverse velocity
+        // Calculate forces in parallel
+        let forces: Vec<_> = (0..n).into_par_iter().map(|i| {
+            let mut force = [0.0; 3];
+            for j in 0..n {
+                if i != j {
+                    let mut r_ij = [0.0; 3];
+                    for k in 0..3 {
+                        r_ij[k] = positions[i][k] - positions[j][k];
+                        r_ij[k] -= (r_ij[k] / l).round() * l;
+                    }
+                    let r = (r_ij[0].powi(2) + r_ij[1].powi(2) + r_ij[2].powi(2)).sqrt();
+                    let force_magnitude = lj_potential(r) / r;
+                    for k in 0..3 {
+                        force[k] += force_magnitude * r_ij[k];
+                    }
                 }
             }
-        }
+            force
+        }).collect();
 
-        // Update velocities
-        for i in 0..n {
-            for j in 0..3 {
-                velocities[i][j] = (positions_new[i][j] - positions_old[i][j]) / (2.0 * dt);
-            }
-        }
+        // Verlet integration and boundary handling in parallel
+        let (positions_new, new_velocities): (Vec<_>, Vec<_>) = positions.par_iter().zip(positions_old.par_iter()).zip(forces.par_iter()).zip(velocities.par_iter())
+            .map(|(((pos, pos_old), force), _vel)| {
+                let mut pos_new = [0.0; 3];
+                let mut vel_new = [0.0; 3];
+                for j in 0..3 {
+                    pos_new[j] = 2.0 * pos[j] - pos_old[j] + force[j] * dt.powi(2);
+                    vel_new[j] = (pos_new[j] - pos_old[j]) / (2.0 * dt);
+
+                    if pos_new[j] >= l {
+                        pos_new[j] = 2.0 * l - pos_new[j];
+                        vel_new[j] = -vel_new[j];
+                    } else if pos_new[j] <= 0.0 {
+                        pos_new[j] = -pos_new[j];
+                        vel_new[j] = -vel_new[j];
+                    }
+                }
+                (pos_new, vel_new)
+            }).unzip();
+
+        // Update positions and velocities
+        positions_old = positions;
+        positions = positions_new;
+        velocities = new_velocities;
 
         // Calculate the current temperature
-        let mut kinetic_energy = 0.0;
-        for vel in &velocities {
-            kinetic_energy += 0.5 * mass_argon * (vel[0].powi(2) + vel[1].powi(2) + vel[2].powi(2));
-        }
+        let kinetic_energy: f64 = velocities.par_iter().map(|vel| {
+            0.5 * mass_argon * (vel[0].powi(2) + vel[1].powi(2) + vel[2].powi(2))
+        }).sum();
         let current_temperature = (2.0 * kinetic_energy) / (3.0 * n as f64 * kb);
 
-        // Calculate the scaling factor
+        // Calculate the scaling factor and scale velocities
         let scaling_factor = (1.0 + dt / tau * (target_temperature / current_temperature - 1.0)).sqrt();
-
-        // Scale the velocities
-        for vel in velocities.iter_mut() {
+        velocities.par_iter_mut().for_each(|vel| {
             for coord in vel.iter_mut() {
                 *coord *= scaling_factor;
             }
-        }
+        });
 
         // Store trajectory data
         if step % snapshot_interval == 0 {
             trajectory.push(positions.clone());
         }
 
-        // Update positions
-        positions_old.copy_from_slice(&positions);
-        positions.copy_from_slice(&positions_new);
+        // Update progress bar with time left and speed
+        let now = Instant::now();
+        if now.duration_since(last_update) >= update_interval {
+            let elapsed = now.duration_since(start_time);
+            let iterations_per_sec = step as f64 / elapsed.as_secs_f64();
+            let estimated_total = Duration::from_secs_f64(steps as f64 / iterations_per_sec);
+            let time_left = estimated_total.saturating_sub(elapsed);
+            
+            pb.set_message(format!(
+                "Speed: {:.2} it/s | Time left: {}",
+                iterations_per_sec,
+                HumanDuration(time_left)
+            ));
+            
+            last_update = now;
+        }
     }
 
-    // Finish the progress bar
     pb.finish_with_message("Simulation complete");
 
-    // Prepare simulation data for output
     let simulation_data = SimulationData {
         box_length: l,
         num_atoms: n,
@@ -164,7 +167,6 @@ fn main() {
         trajectory,
     };
 
-    // Save simulation data to JSON file
     let json = serde_json::to_string(&simulation_data).unwrap();
     let mut file = File::create("simulation_data.json").unwrap();
     file.write_all(json.as_bytes()).unwrap();
